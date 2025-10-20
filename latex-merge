@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""
+latex-merge - Recursively merges LaTeX documents with \\input and \\include commands
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from typing import Set, List
+
+
+def process_file(
+    filepath: Path,
+    output_lines: List[str],
+    visited_files: Set[Path],
+    verbose: bool = False
+) -> None:
+    """
+    Recursively process a LaTeX file, expanding \\input and \\include commands.
+
+    Args:
+        filepath: Path to the file to process
+        output_lines: List to append processed content to
+        visited_files: Set of files currently being processed (for circular dependency detection)
+        verbose: Print verbose output
+
+    Raises:
+        FileNotFoundError: If the file doesn't exist
+        RecursionError: If circular dependency is detected
+    """
+    if verbose:
+        print(f"Processing: {filepath}")
+
+    # Check for circular dependencies
+    if filepath in visited_files:
+        cycle_path = " -> ".join(str(f) for f in list(visited_files) + [filepath])
+        raise RecursionError(f"Circular dependency detected: {cycle_path}")
+
+    # Check if file exists
+    if not filepath.exists():
+        raise FileNotFoundError(f"Included file '{filepath}' not found")
+
+    visited_files.add(filepath)
+
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        # Process each line
+        for line_num, line in enumerate(lines, 1):
+            # Skip commented lines
+            if line.strip().startswith('%'):
+                output_lines.append(line)
+                continue
+
+            # Look for \input or \include commands
+            match = re.search(r'\\(input|include)\s*\{([^}]+)\}', line)
+
+            if match:
+                command, filename = match.groups()
+
+                # Ensure .tex extension
+                if not filename.endswith('.tex'):
+                    filename += '.tex'
+
+                # Resolve path relative to current file
+                include_path = filepath.parent / filename
+
+                # Recursively process the included file
+                process_file(include_path, output_lines, visited_files.copy(), verbose)
+            else:
+                # Regular line, append as-is
+                output_lines.append(line)
+
+    except UnicodeDecodeError as e:
+        raise ValueError(f"Error reading file '{filepath}': {e}")
+
+    finally:
+        visited_files.discard(filepath)
+
+
+def run_tests() -> None:
+    """Run built-in tests."""
+    print("Running built-in tests...")
+
+    # Test 1: Basic include resolution
+    print("Test 1: Basic include resolution")
+    try:
+        test_dir = Path("test_merge_basic")
+        test_dir.mkdir(exist_ok=True)
+
+        # Create main file
+        main_content = r"""\documentclass{article}
+\begin{document}
+\input{section1}
+\input{section2}
+\end{document}
+"""
+        (test_dir / "main.tex").write_text(main_content)
+
+        # Create section files
+        (test_dir / "section1.tex").write_text("Section 1 content\n")
+        (test_dir / "section2.tex").write_text("Section 2 content\n")
+
+        # Test merging
+        output_lines: List[str] = []
+        process_file(test_dir / "main.tex", output_lines, set())
+
+        merged_content = ''.join(output_lines)
+        assert "Section 1 content" in merged_content
+        assert "Section 2 content" in merged_content
+        assert r"\input{section1}" not in merged_content
+        assert r"\input{section2}" not in merged_content
+
+        print("✓ Basic include resolution test passed")
+
+    except Exception as e:
+        print(f"✗ Basic include resolution test failed: {e}")
+        return False
+
+    # Test 2: Nested includes
+    print("Test 2: Nested includes")
+    try:
+        nested_dir = Path("test_merge_nested")
+        nested_dir.mkdir(exist_ok=True)
+
+        # Create nested structure
+        (nested_dir / "main.tex").write_text(r"""\documentclass{article}
+\begin{document}
+\input{sections/intro}
+\end{document}
+""")
+
+        (nested_dir / "sections").mkdir(exist_ok=True)
+        (nested_dir / "sections" / "intro.tex").write_text(r"""\input{../common/macros}
+Introduction content
+""")
+
+        (nested_dir / "common").mkdir(exist_ok=True)
+        (nested_dir / "common" / "macros.tex").write_text("Macro definitions\n")
+
+        # Test merging
+        output_lines: List[str] = []
+        process_file(nested_dir / "main.tex", output_lines, set())
+
+        merged_content = ''.join(output_lines)
+        assert "Macro definitions" in merged_content
+        assert "Introduction content" in merged_content
+
+        print("✓ Nested includes test passed")
+
+    except Exception as e:
+        print(f"✗ Nested includes test failed: {e}")
+        return False
+
+    # Test 3: Circular dependency detection
+    print("Test 3: Circular dependency detection")
+    try:
+        circular_dir = Path("test_merge_circular")
+        circular_dir.mkdir(exist_ok=True)
+
+        # Create circular dependency
+        (circular_dir / "a.tex").write_text(r"""\documentclass{article}
+\begin{document}
+\input{b}
+\end{document}
+""")
+        (circular_dir / "b.tex").write_text(r"\input{a}")
+
+        # Test circular dependency detection
+        output_lines: List[str] = []
+        try:
+            process_file(circular_dir / "a.tex", output_lines, set())
+            print("✗ Circular dependency test failed: should have detected circular dependency")
+            return False
+        except RecursionError:
+            print("✓ Circular dependency detection test passed")
+
+    except Exception as e:
+        print(f"✗ Circular dependency test failed: {e}")
+        return False
+
+    # Cleanup test directories
+    import shutil
+    for test_dir in ["test_merge_basic", "test_merge_nested", "test_merge_circular"]:
+        try:
+            shutil.rmtree(test_dir)
+        except:
+            pass
+
+    print("All tests passed!")
+    return True
+
+
+def main() -> None:
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Merge LaTeX documents with \\input and \\include commands"
+    )
+
+    parser.add_argument(
+        "input_file",
+        nargs="?",
+        help="Main LaTeX file to process"
+    )
+
+    parser.add_argument(
+        "--output", "-o",
+        help="Output file (default: <input>_merged.tex)"
+    )
+
+    parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Overwrite existing output file"
+    )
+
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Verbose output"
+    )
+
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run built-in tests"
+    )
+
+    args = parser.parse_args()
+
+    if args.test:
+        success = run_tests()
+        sys.exit(0 if success else 1)
+
+    if not args.input_file:
+        parser.error("input_file is required")
+
+    input_path = Path(args.input_file)
+
+    if not input_path.exists():
+        print(f"Error: Input file '{input_path}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Determine output filename
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = input_path.parent / f"{input_path.stem}_merged.tex"
+
+    # Check if output file exists
+    if output_path.exists() and not args.force:
+        print(f"Error: Output file '{output_path}' already exists. Use --force to overwrite.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        if args.verbose:
+            print(f"Merging '{input_path}' -> '{output_path}'")
+
+        # Process the file
+        output_lines: List[str] = []
+        process_file(input_path, output_lines, set(), args.verbose)
+
+        # Write output
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.writelines(output_lines)
+
+        if args.verbose:
+            print(f"Successfully merged {len(output_lines)} lines")
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

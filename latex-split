@@ -1,0 +1,1362 @@
+#!/usr/bin/env python3
+"""
+latex-split.py: Split LaTeX documents into modular structures.
+
+This module implements the core parsing functions for breaking down monolithic
+LaTeX documents into structured, modular components.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Tuple, NamedTuple, Optional, Dict
+
+
+# Data Structures
+@dataclass(frozen=True)
+class Section:
+    """Represents a LaTeX section with content and metadata."""
+    level: int  # 1=section, 2=subsection, 3=subsubsection
+    section_type: str  # "section", "subsection", "subsubsection"
+    title: str  # Raw LaTeX title
+    sanitized_title: str  # Filename-safe title
+    content: str  # Content until next same-level section
+    line_number: int  # Line position in source
+    is_starred: bool  # Whether command is starred (e.g., \section*)
+
+
+@dataclass(frozen=True)
+class ParsedDocument:
+    """Complete parsed LaTeX document."""
+    preamble: str  # Up to and including \begin{document}
+    body: str  # Content between \begin{document} and first section command
+    sections: List[Section]  # All sections in order
+    unsectioned_content: str  # Content not in any section
+    postamble: str  # After main content (bibliography, etc.)
+
+
+@dataclass(frozen=True)
+class SectionCommand:
+    """Represents a LaTeX sectioning command with position and metadata."""
+    position: int  # Character position in the document body
+    section_type: str  # "section", "subsection", "subsubsection"
+    title: str  # Raw LaTeX title content
+    is_starred: bool  # Whether command is starred (e.g., \section*)
+    line_number: int  # Line number in the source document
+
+
+@dataclass(frozen=True)
+class SectionExtractionResult:
+    """Result of extracting sections from document body."""
+    sections: List[Section]  # All extracted sections in order
+    unsectioned_content: str  # Content not belonging to any section
+
+
+class DocumentParts(NamedTuple):
+    """Raw document parts before section processing."""
+    preamble: str
+    body: str  # Everything between \begin{document} and \end{document}
+    postamble: str  # After \end{document} (typically empty for valid LaTeX)
+
+
+# Phase 1: Core Parsing Functions
+
+def split_document_parts(content: str) -> DocumentParts:
+    """Split LaTeX content into preamble, body, postamble.
+
+    Args:
+        content: Full LaTeX document content
+
+    Returns:
+        DocumentParts with separated content sections
+
+    Raises:
+        ValueError: If document structure is invalid (missing begin/end document)
+    """
+    # Find \begin{document} and \end{document}
+    begin_match = re.search(r'\\begin\s*\{\s*document\s*\}', content, re.IGNORECASE)
+    end_match = re.search(r'\\end\s*\{\s*document\s*\}', content, re.IGNORECASE)
+
+    if not begin_match:
+        raise ValueError("Document missing \\begin{document}")
+    if not end_match:
+        raise ValueError("Document missing \\end{document}")
+
+    if begin_match.end() > end_match.start():
+        raise ValueError("\\begin{document} appears after \\end{document}")
+
+    # Extract preamble up to and including \begin{document}
+    preamble = content[:begin_match.end()]
+
+    # Find bibliography-related content to determine postamble start
+    body_content = content[begin_match.end():end_match.start()]
+
+    # Look for bibliography-related commands in the body
+    bib_patterns = [
+        r'\\bibliography\s*\{[^}]*\}',
+        r'\\bibliographystyle\s*\{[^}]*\}',
+        r'\\begin\s*\{\s*thebibliography\s*\}',
+        r'\\printindex',
+        r'\\appendix'
+    ]
+
+    postamble_start = None
+    for pattern in bib_patterns:
+        match = re.search(pattern, body_content, re.IGNORECASE)
+        if match and (postamble_start is None or match.start() < postamble_start):
+            postamble_start = match.start()
+
+    # Split body and postamble
+    if postamble_start is not None:
+        body = body_content[:postamble_start]
+        postamble = body_content[postamble_start:] + content[end_match.start():]
+    else:
+        body = body_content
+        postamble = content[end_match.start():]
+
+    return DocumentParts(preamble=preamble, body=body, postamble=postamble)
+
+
+def find_sectioning_commands(content: str, max_depth: int) -> List[SectionCommand]:
+    """Find sectioning commands in body content.
+
+    Args:
+        content: LaTeX body content to search
+        max_depth: Maximum sectioning depth (1-3)
+
+    Returns:
+        List of SectionCommand objects with position, type, title, starred status, and line number
+
+    Supported commands:
+        - \\section, \\section*
+        - \\subsection, \\subsection*
+        - \\subsubsection, \\subsubsection*
+    """
+    if not 1 <= max_depth <= 3:
+        raise ValueError("max_depth must be between 1 and 3")
+
+    # Build sectioning commands based on depth
+    section_types = ["section"]
+    if max_depth >= 2:
+        section_types.append("subsection")
+    if max_depth >= 3:
+        section_types.append("subsubsection")
+
+    # Create pattern to find sectioning commands with their opening brace
+    pattern_parts = []
+    for section_type in section_types:
+        pattern_parts.append(rf"\\{section_type}\*?\s*\{{")
+
+    pattern = "|".join(pattern_parts)
+
+    commands = []
+    current_line = 1
+
+    # Find all sectioning command positions
+    for match in re.finditer(pattern, content):
+        position = match.start()
+
+        # Count newlines before this match to get line number
+        current_line = content[:position].count('\n') + 1
+
+        # Extract command details
+        full_command = match.group(0)
+
+        # Determine which section type this is
+        section_type = None
+        for stype in section_types:
+            if re.match(rf"\\{stype}\*?", full_command):
+                section_type = stype
+                break
+
+        if not section_type:
+            continue
+
+        is_starred = '*' in full_command
+        level = section_types.index(section_type) + 1
+
+        # Extract title by finding balanced braces
+        brace_start = match.end() - 1  # Position of opening brace
+        brace_count = 1
+        title_end = brace_start + 1
+
+        while brace_count > 0 and title_end < len(content):
+            if content[title_end] == '{':
+                brace_count += 1
+            elif content[title_end] == '}':
+                brace_count -= 1
+            title_end += 1
+
+        if brace_count == 0:
+            title = content[brace_start + 1:title_end - 1]  # Extract content between braces
+        else:
+            # Unbalanced braces - skip this command
+            continue
+
+        commands.append(SectionCommand(
+            position=position,
+            section_type=section_type,
+            title=title,
+            is_starred=is_starred,
+            line_number=current_line
+        ))
+
+    return commands
+
+
+def extract_sections_from_body(body: str, commands: List[SectionCommand]) -> SectionExtractionResult:
+    """Extract sections from body content.
+
+    Args:
+        body: Document body content
+        commands: List of SectionCommand objects from find_sectioning_commands
+
+    Returns:
+        SectionExtractionResult with sections list and unsectioned content
+
+    Handles cases where document has only subsections without sections.
+    """
+    if not commands:
+        # No sections found - all content is unsectioned
+        return SectionExtractionResult(sections=[], unsectioned_content=body.strip())
+
+    # Sort commands by position
+    commands.sort(key=lambda x: x.position)
+
+    sections = []
+    unsectioned_parts = []
+    last_position = 0
+
+    for i, command in enumerate(commands):
+        # Content between last command and this command
+        if command.position > last_position:
+            content_between = body[last_position:command.position].strip()
+            if content_between:
+                unsectioned_parts.append(content_between)
+
+        # Find content for this section (until next command or end)
+        next_position = commands[i + 1].position if i + 1 < len(commands) else len(body)
+        section_content = body[command.position:next_position]
+
+        # Determine level based on section type
+        level_mapping = {"section": 1, "subsection": 2, "subsubsection": 3}
+        level = level_mapping.get(command.section_type, 1)
+
+        # Create section with sanitized title
+        raw_title = command.title.strip() if command.title else ""
+        sanitized_title = sanitize_latex_title(raw_title)
+
+        section = Section(
+            level=level,
+            section_type=command.section_type,
+            title=raw_title,
+            sanitized_title=sanitized_title,
+            content=section_content,
+            line_number=command.line_number,
+            is_starred=command.is_starred
+        )
+        sections.append(section)
+        last_position = next_position
+
+    # Combine unsectioned content
+    unsectioned_content = "\n\n".join(unsectioned_parts)
+
+    return SectionExtractionResult(sections=sections, unsectioned_content=unsectioned_content)
+
+
+# Phase 2: Content Processing Functions
+
+def sanitize_latex_title(title: str | None) -> str:
+    """Convert LaTeX title to valid filename (50 char max).
+
+    Args:
+        title: Raw LaTeX section title
+
+    Returns:
+        Sanitized filename (max 50 chars, lowercase, underscores)
+
+    Raises:
+        ValueError: If title contains unhandled math mode
+    """
+    if not title or not title.strip():
+        return "untitled"
+
+    # Handle math mode first
+    title = handle_math_mode_in_title(title)
+
+    # Remove LaTeX commands while preserving content
+    title = remove_latex_commands(title)
+
+    # Clean filename characters
+    title = clean_filename_chars(title)
+
+    # Convert to lowercase and replace spaces/hyphens with underscores
+    title = title.lower().replace(' ', '_').replace('-', '_')
+
+    # Remove multiple consecutive underscores
+    title = re.sub(r'_+', '_', title)
+
+    # Remove leading/trailing underscores
+    title = title.strip('_')
+
+    # Truncate to 50 characters
+    if len(title) > 50:
+        title = title[:50].rstrip('_')
+
+    # Ensure we don't end up with empty string
+    if not title:
+        return "untitled"
+
+    return title
+
+
+def remove_latex_commands(text: str) -> str:
+    """Remove LaTeX commands while preserving content.
+
+    Args:
+        text: Text containing LaTeX commands
+
+    Returns:
+        Text with commands removed
+    """
+    if not text:
+        return text
+
+    # Remove simple commands like \textit{content} -> content
+    # This handles nested braces to some extent
+    text = re.sub(r'\\[a-zA-Z]+\*?\{([^{}]*)\}', r'\1', text)
+
+    # Remove specific known commands without braces
+    known_commands = ['LaTeX', 'TeX', 'AmS', 'AmSTeX', 'BibTeX', 'XeTeX', 'LuaTeX']
+    for cmd in known_commands:
+        text = text.replace(f'\\{cmd}', cmd.lower())
+
+    # Remove remaining commands without braces (but be careful with backslashes)
+    text = re.sub(r'\\[a-zA-Z]+\*?(?![a-zA-Z])', '', text)
+
+    # Remove curly braces (they might remain from nested structures)
+    text = text.replace('{', '').replace('}', '')
+
+    return text
+
+
+def handle_math_mode_in_title(text: str) -> str:
+    """Handle math mode in section titles.
+
+    Args:
+        text: Text that may contain math mode
+
+    Returns:
+        Text with math mode properly handled
+
+    Raises:
+        ValueError: If complex math mode found without texorpdfstring
+    """
+    if not text:
+        return text
+
+    # Handle \texorpdfstring{math}{text} -> text with balanced brace parsing
+    while True:
+        # Find the next \texorpdfstring command
+        texorpdf_start = text.find(r'\texorpdfstring')
+        if texorpdf_start == -1:
+            break
+
+        # Find the opening brace of the first argument
+        first_brace = text.find('{', texorpdf_start)
+        if first_brace == -1:
+            break
+
+        # Parse the first argument (math part) with balanced braces
+        brace_count = 1
+        pos = first_brace + 1
+        first_arg_end = pos
+
+        while brace_count > 0 and pos < len(text):
+            if text[pos] == '{':
+                brace_count += 1
+            elif text[pos] == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    first_arg_end = pos
+                    break
+            pos += 1
+
+        if brace_count > 0:
+            # Unbalanced braces, skip this command
+            break
+
+        # Find the opening brace of the second argument
+        second_brace = text.find('{', first_arg_end + 1)
+        if second_brace == -1:
+            break
+
+        # Parse the second argument (text part) with balanced braces
+        brace_count = 1
+        pos = second_brace + 1
+        second_arg_end = pos
+
+        while brace_count > 0 and pos < len(text):
+            if text[pos] == '{':
+                brace_count += 1
+            elif text[pos] == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    second_arg_end = pos
+                    break
+            pos += 1
+
+        if brace_count > 0:
+            # Unbalanced braces, skip this command
+            break
+
+        # Extract the text part (second argument)
+        text_part = text[second_brace + 1:second_arg_end]
+
+        # Replace the entire \texorpdfstring command with just the text part
+        text = text[:texorpdf_start] + text_part + text[second_arg_end + 1:]
+
+    # After processing all texorpdfstrings, check for remaining math mode
+    if re.search(r'\$[^$\n]*\$', text):
+        raise ValueError(
+            "Math mode detected in title without \\texorpdfstring. "
+            "Use \\texorpdfstring{math}{text} format. Title: " + text
+        )
+
+    # Check for display math mode without texorpdfstring
+    if re.search(r'\\\[.*?\\\]', text):
+        raise ValueError(
+            "Display math detected in title without \\texorpdfstring. "
+            "Use \\texorpdfstring{math}{text} format. Title: " + text
+        )
+
+    return text
+
+
+def clean_filename_chars(text: str) -> str:
+    """Remove illegal filename characters.
+
+    Args:
+        text: Text to clean
+
+    Returns:
+        Text with illegal characters removed/replaced
+    """
+    if not text:
+        return text
+
+    # Replace illegal filename characters with underscores: / \ : * ? " < > |
+    illegal_chars = r'[/\\:*?"<>|]'
+    text = re.sub(illegal_chars, '_', text)
+
+    # Replace other problematic characters with underscores
+    # This includes quotes, apostrophes, etc.
+    text = re.sub(r"[\"'`]", '_', text)
+
+    return text
+
+
+# Phase 3: File Generation Functions
+
+def create_section_file_paths(sections: List[Section], output_dir: Path) -> Dict[int, Path]:
+    """Create hierarchical directory structure mapping.
+
+    Args:
+        sections: List of parsed sections (in order)
+        output_dir: Base output directory
+
+    Returns:
+        Directory mapping section_index -> file_path
+
+    Uses the ordered nature of sections to build hierarchy efficiently.
+    Handles documents with only subsections by promoting them to top-level.
+    """
+    if not sections:
+        return {}
+
+    file_paths = {}
+    current_section_dir = None
+    current_subsection_dir = None
+
+    # Check if we have any top-level sections
+    has_sections = any(section.level == 1 for section in sections)
+
+    for i, section in enumerate(sections):
+        if has_sections:
+            # Normal hierarchy: sections → subsections → subsubsections
+            if section.level == 1:
+                current_section_dir = output_dir / section.sanitized_title
+                current_subsection_dir = None  # Reset when we hit a new section
+                file_path = current_section_dir / f"{section.sanitized_title}.tex"
+            elif section.level == 2:
+                if current_section_dir:
+                    # Subsections go in the section directory
+                    file_path = current_section_dir / f"{section.sanitized_title}.tex"
+                else:
+                    # No parent section, promote to top-level
+                    current_section_dir = output_dir / section.sanitized_title
+                    file_path = current_section_dir / f"{section.sanitized_title}.tex"
+                # This subsection can now contain subsubsections
+                current_subsection_dir = current_section_dir / f"{section.sanitized_title}"
+            elif section.level == 3:
+                if current_subsection_dir:
+                    # Subsubsections go in the current subsection directory
+                    file_path = current_subsection_dir / f"{section.sanitized_title}.tex"
+                elif current_section_dir:
+                    # No current subsection, create subsubsection directly under section
+                    file_path = current_section_dir / f"{section.sanitized_title}.tex"
+                else:
+                    # No parents, promote to top-level
+                    file_path = output_dir / section.sanitized_title / f"{section.sanitized_title}.tex"
+            else:
+                # Unknown level, treat as top-level
+                file_path = output_dir / section.sanitized_title / f"{section.sanitized_title}.tex"
+        else:
+            # No top-level sections, treat subsections as top-level
+            if section.level <= 2:
+                current_section_dir = output_dir / section.sanitized_title
+                file_path = current_section_dir / f"{section.sanitized_title}.tex"
+            else:
+                # Subsubsections get their own directories
+                file_path = output_dir / section.sanitized_title / f"{section.sanitized_title}.tex"
+
+        file_paths[i] = file_path
+
+    return file_paths
+
+
+
+
+def generate_main_tex_content(document: ParsedDocument, file_paths: Dict[int, Path],
+                             main_filename: str) -> str:
+    """Generate main.tex content with include commands.
+
+    Args:
+        document: Parsed document structure
+        file_paths: Section index to file path mapping
+        main_filename: Name of the main file (for relative path calculation)
+
+    Returns:
+        Complete main.tex content as string
+
+    Creates relative paths from main.tex to section files using \\include.
+    """
+    lines = []
+
+    # Add preamble
+    lines.append(document.preamble.strip())
+    lines.append("")
+
+    # Add unsectioned content (abstract, etc.)
+    if document.unsectioned_content.strip():
+        lines.append(document.unsectioned_content.strip())
+        lines.append("")
+
+    # Add include commands for each section
+    main_path = Path(main_filename).parent
+
+    for i, section in enumerate(document.sections):
+        if i in file_paths:
+            # Calculate relative path from main file to section file
+            section_file = file_paths[i]
+            relative_path = os.path.relpath(section_file, main_path)
+
+            # Convert to LaTeX path format (use forward slashes)
+            relative_path = relative_path.replace('\\', '/')
+
+            # Remove .tex extension for \include command
+            include_path = relative_path[:-4] if relative_path.endswith('.tex') else relative_path
+
+            lines.append(f"\\include{{{include_path}}}")
+
+    # Add postamble if it exists
+    if document.postamble.strip():
+        lines.append("")
+        lines.append(document.postamble.strip())
+
+    return "\n".join(lines)
+
+
+def generate_section_content(section: Section) -> str:
+    """Generate content for individual section file.
+
+    Args:
+        section: Section object with title and content
+
+    Returns:
+        Complete content for the section file
+
+    Includes the sectioning command and all content until next section.
+    """
+    return section.content.strip()
+
+
+def create_split_document(document: ParsedDocument, file_paths: Dict[int, Path],
+                         main_filename: str, output_dir: Path, force: bool = False) -> None:
+    """Create the output directory structure and files.
+
+    Args:
+        document: Parsed document structure
+        file_paths: Section index to file path mapping
+        main_filename: Name for the main file
+        output_dir: Base output directory for main file
+        force: Whether to overwrite existing files
+
+    Raises:
+        FileExistsError: If files already exist and force=False
+        OSError: If directory creation fails
+    """
+    # Collect all files to write
+    files_to_write = []
+
+    # Add main file - place it in the top-level output directory
+    main_path = output_dir / main_filename
+
+    main_content = generate_main_tex_content(document, file_paths, str(main_path))
+    files_to_write.append((main_path, main_content))
+
+    # Add section files
+    for i, section in enumerate(document.sections):
+        if i in file_paths:
+            section_content = generate_section_content(section)
+            files_to_write.append((file_paths[i], section_content))
+
+    # Write all files safely
+    write_files_safe(files_to_write, force)
+
+
+def write_files_safe(files: List[Tuple[Path, str]], force: bool = False) -> None:
+    """Write files with safety checks.
+
+    Args:
+        files: List of (path, content) tuples
+        force: Whether to overwrite existing files
+
+    Raises:
+        FileExistsError: If files already exist and force=False
+        OSError: If directory creation or file writing fails
+    """
+    # Check for existing files first
+    if not force:
+        for file_path, _ in files:
+            if file_path.exists():
+                raise FileExistsError(f"File already exists: {file_path}")
+
+    # Create directories and write files
+    for file_path, content in files:
+        # Create parent directories if needed
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write file with UTF-8 encoding
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+
+def split_latex_document(input_file: Path, output_dir: Optional[Path] = None,
+                        main_filename: str = "main.tex", max_depth: int = 2,
+                        force: bool = False, verbose: bool = False) -> None:
+    """Split LaTeX document into modular structure.
+
+    Args:
+        input_file: Path to input LaTeX file
+        output_dir: Output directory (default: current directory)
+        main_filename: Name for main output file (default: main.tex)
+        max_depth: Maximum sectioning depth (1-3, default: 2)
+        force: Overwrite existing files (default: False)
+        verbose: Print progress information (default: False)
+
+    Raises:
+        FileNotFoundError: If input file doesn't exist
+        ValueError: If document structure is invalid
+        FileExistsError: If output files exist and force=False
+        OSError: If file operations fail
+    """
+    # Set default output directory
+    if output_dir is None:
+        output_dir = Path.cwd()
+
+    # Validate input
+    if not input_file.exists():
+        raise FileNotFoundError(f"Input file not found: {input_file}")
+
+    if not 1 <= max_depth <= 3:
+        raise ValueError("max_depth must be between 1 and 3")
+
+    if verbose:
+        print(f"Reading LaTeX document: {input_file}")
+
+    # Read input file
+    with open(input_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    if not content.strip():
+        raise ValueError(f"Input file is empty: {input_file}")
+
+    # Parse document
+    document = parse_latex_document(content, max_depth)
+
+    if verbose:
+        print(f"Parsed document with {len(document.sections)} sections")
+
+    # Create file paths
+    file_paths = create_section_file_paths(document.sections, output_dir)
+
+    if verbose:
+        print(f"Created file paths for {len(file_paths)} section files")
+
+    # Create split document
+    create_split_document(document, file_paths, main_filename, output_dir, force)
+
+    if verbose:
+        print(f"Successfully created split document in: {output_dir}")
+        print(f"Main file: {output_dir / main_filename}")
+        for i, path in file_paths.items():
+            print(f"  Section {i + 1}: {path}")
+
+
+# Integration function
+def parse_latex_document(content: str, max_depth: int) -> ParsedDocument:
+    """High-level document parsing using component functions.
+
+    Args:
+        content: Full LaTeX document content
+        max_depth: Maximum sectioning depth (1-3)
+
+    Returns:
+        ParsedDocument with structured content
+
+    Raises:
+        ValueError: If document structure is invalid
+    """
+    parts = split_document_parts(content)
+    commands = find_sectioning_commands(parts.body, max_depth)
+    extraction_result = extract_sections_from_body(parts.body, commands)
+    sections = extraction_result.sections
+    unsectioned_content = extraction_result.unsectioned_content
+
+    return ParsedDocument(
+        preamble=parts.preamble,
+        body=parts.body,  # Body already excludes postamble from split_document_parts
+        sections=sections,
+        unsectioned_content=unsectioned_content,
+        postamble=parts.postamble
+    )
+
+
+# CLI Interface
+def main() -> None:
+    """Command-line interface for latex-split."""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="Split LaTeX documents into modular structures")
+    parser.add_argument("input_file", nargs='?', help="Input LaTeX file")
+    parser.add_argument("--test", action="store_true", help="Run built-in tests")
+    parser.add_argument("--output-dir", "-o", type=str, help="Output directory (default: current directory)")
+    parser.add_argument("--main-filename", "-m", type=str, default="main.tex",
+                        help="Name for main output file (default: main.tex)")
+    parser.add_argument("--depth", "-d", type=int, default=2, choices=[1, 2, 3],
+                        help="Maximum sectioning depth (1-3, default: 2)")
+    parser.add_argument("--force", "-f", action="store_true",
+                        help="Overwrite existing files")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+
+    args = parser.parse_args()
+
+    if args.test:
+        run_tests()
+        return
+
+    if not args.input_file:
+        print("Error: input_file is required unless using --test", file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
+
+    # Convert arguments to Path objects
+    input_path = Path(args.input_file)
+    output_dir = Path(args.output_dir) if args.output_dir else None
+
+    # Split document
+    split_latex_document(
+        input_file=input_path,
+        output_dir=output_dir,
+        main_filename=args.main_filename,
+        max_depth=args.depth,
+        force=args.force,
+        verbose=args.verbose
+    )
+
+
+def run_tests() -> None:
+    """Run built-in tests for Phase 1 functions."""
+    print("Running Phase 1 tests...")
+
+    # Test 1: split_document_parts
+    test_content = r"""
+\documentclass{article}
+\title{Test Document}
+
+\begin{document}
+
+
+Lorem ipsum.
+\section{Introduction}
+This is the introduction.
+
+\subsection*{First}
+\subsection{Second}
+Alef
+\subsection*{Third}
+Bet
+
+\section{Conclusion}
+This is the conclusion.
+\begin{bibliography}
+\end{document}
+"""
+
+    try:
+        parts = split_document_parts(test_content)
+        assert r"\begin{document}" in parts.preamble
+        assert "Lorem ipsum" in parts.body
+        assert r"\end{document}" in parts.postamble
+        print("✓ split_document_parts test passed")
+    except Exception as e:
+        print(f"✗ split_document_parts test failed: {e}")
+        return
+
+    # Test 2: find_sectioning_commands with mixed starred/unstarred sections
+    try:
+        commands = find_sectioning_commands(test_content, max_depth=2)
+
+        # Handle None titles for subsections without explicit titles
+        expected_commands = 5
+        assert len(commands) == expected_commands, f"Expected {expected_commands} commands, got {len(commands)}"
+        assert commands[0].section_type == "section" and commands[0].title == "Introduction"
+        assert commands[0].is_starred == False  # not starred
+
+        # Check subsections (some may have None titles if they don't have explicit braces)
+        assert commands[1].section_type == "subsection" and commands[1].is_starred == True  # starred
+        assert commands[2].section_type == "subsection" and commands[2].is_starred == False  # not starred
+        assert commands[3].section_type == "subsection" and commands[3].is_starred == True  # starred
+        assert commands[4].section_type == "section" and commands[4].title == "Conclusion" and commands[4].is_starred == False
+
+        print("✓ find_sectioning_commands test passed")
+    except Exception as e:
+        print(f"✗ find_sectioning_commands test failed: {e}")
+        return
+
+    # Test 3: extract_sections_from_body with unsectioned content
+    try:
+        parts = split_document_parts(test_content)
+        commands = find_sectioning_commands(parts.body, max_depth=2)
+        extraction_result = extract_sections_from_body(parts.body, commands)
+        sections = extraction_result.sections
+        unsectioned = extraction_result.unsectioned_content
+
+        assert len(sections) == 5
+        assert "Lorem ipsum" in unsectioned
+        assert sections[0].title == "Introduction"
+        assert sections[0].is_starred == False
+        assert sections[1].section_type == "subsection" and sections[1].is_starred == True
+        assert sections[2].section_type == "subsection" and sections[2].is_starred == False
+        assert "Alef" in sections[2].content
+        print("✓ extract_sections_from_body test passed")
+    except Exception as e:
+        print(f"✗ extract_sections_from_body test failed: {e}")
+        return
+
+    # Test 4: parse_latex_document integration with postamble detection
+    try:
+        document = parse_latex_document(test_content, max_depth=2)
+        assert len(document.sections) == 5, f"Expected 5 sections, got {len(document.sections)}"
+        assert r"\documentclass" in document.preamble
+        assert "Lorem ipsum" in document.unsectioned_content
+        # Note: postamble detection depends on bibliography keywords
+        print("✓ parse_latex_document integration test passed")
+    except Exception as e:
+        print(f"✗ parse_latex_document integration test failed: {e}")
+        return
+
+    # Additional comprehensive tests for corner cases
+    print("Running additional corner case tests...")
+
+    # Test 5: Document with only subsections (no sections)
+    subsections_only = r"""
+\documentclass{article}
+\begin{document}
+\subsection{Introduction}
+Some intro text.
+\subsection{Methods}
+Methods description.
+\subsection{Results}
+Results go here.
+\end{document}
+"""
+    try:
+        document = parse_latex_document(subsections_only, max_depth=2)
+        assert len(document.sections) == 3
+        assert all(section.level == 2 for section in document.sections)
+        assert all(section.section_type == "subsection" for section in document.sections)
+        print("✓ Subsections-only document test passed")
+    except Exception as e:
+        print(f"✗ Subsections-only test failed: {e}")
+        return
+
+    # Test 6: Document with no sections at all
+    no_sections = r"""
+\documentclass{article}
+\begin{document}
+This is a simple document without any sections.
+Just some paragraphs of text.
+
+Another paragraph here.
+\bibliography{refs}
+\end{document}
+"""
+    try:
+        document = parse_latex_document(no_sections, max_depth=2)
+        assert len(document.sections) == 0
+        assert "This is a simple document" in document.unsectioned_content
+        assert "Another paragraph" in document.unsectioned_content
+        print("✓ No-sections document test passed")
+    except Exception as e:
+        print(f"✗ No-sections test failed: {e}")
+        return
+
+    # Test 7: Deep hierarchy with different depth levels
+    deep_hierarchy = r"""
+\documentclass{book}
+\begin{document}
+\section{Chapter 1}
+Chapter content.
+
+\subsection{Section 1.1}
+Section content.
+
+\subsubsection{Subsection 1.1.1}
+Deep content.
+
+\subsubsection*{Starred Deep}
+Starred deep content.
+
+\subsection{Section 1.2}
+More section content.
+
+\section{Chapter 2}
+Chapter 2 content.
+\end{document}
+"""
+    try:
+        # Test different depth levels
+        doc_depth1 = parse_latex_document(deep_hierarchy, max_depth=1)
+        assert len(doc_depth1.sections) == 2  # Only sections
+
+        doc_depth2 = parse_latex_document(deep_hierarchy, max_depth=2)
+        assert len(doc_depth2.sections) == 4  # Sections + subsections
+
+        doc_depth3 = parse_latex_document(deep_hierarchy, max_depth=3)
+        assert len(doc_depth3.sections) == 6  # All levels
+        assert any(section.section_type == "subsubsection" for section in doc_depth3.sections)
+        print("✓ Deep hierarchy test passed")
+    except Exception as e:
+        print(f"✗ Deep hierarchy test failed: {e}")
+        return
+
+    # Test 8: Line number tracking
+    multiline_test = r"""
+\documentclass{article}
+\begin{document}
+
+\section{First Section}
+Content on line 6.
+
+\subsection{Subsection}
+Content on line 9.
+
+\section{Second Section}
+Content on line 12.
+\end{document}
+"""
+    try:
+        commands = find_sectioning_commands(multiline_test, max_depth=2)
+        assert commands[0].line_number == 5  # First section on line 5
+        assert commands[1].line_number == 8  # Subsection on line 8
+        assert commands[2].line_number == 11  # Second section on line 11
+        print("✓ Line number tracking test passed")
+    except Exception as e:
+        print(f"✗ Line number tracking test failed: {e}")
+        return
+
+    # Test 9: Error handling for malformed documents
+    try:
+        malformed = r"""
+\documentclass{article}
+\begin{document}
+\section{Section 1}
+No end document here.
+"""
+        parse_latex_document(malformed, max_depth=2)
+        print("✗ Error handling test failed: Should have raised ValueError")
+        return
+    except ValueError:
+        pass  # Expected
+    except Exception as e:
+        print(f"✗ Error handling test failed with unexpected error: {e}")
+        return
+
+    # Test 10: Invalid depth parameter
+    try:
+        find_sectioning_commands("\\section{Test}", max_depth=5)
+        print("✗ Invalid depth test failed: Should have raised ValueError")
+        return
+    except ValueError:
+        pass  # Expected
+    except Exception as e:
+        print(f"✗ Invalid depth test failed with unexpected error: {e}")
+        return
+
+    print("✓ Error handling tests passed")
+
+    # Phase 2: Content Processing Tests
+    print("Running Phase 2 content processing tests...")
+
+    # Test 11: Basic title sanitization
+    try:
+        result = sanitize_latex_title("Introduction to Algorithms")
+        assert result == "introduction_to_algorithms"
+        print("✓ Basic title sanitization test passed")
+    except Exception as e:
+        print(f"✗ Basic title sanitization test failed: {e}")
+        return
+
+    # Test 12: LaTeX command removal
+    try:
+        result = sanitize_latex_title("\\textit{Important} Section")
+        assert result == "important_section"
+        print("✓ LaTeX command removal test passed")
+    except Exception as e:
+        print(f"✗ LaTeX command removal test failed: {e}")
+        return
+
+    # Test 13: Math mode with texorpdfstring
+    try:
+        result = sanitize_latex_title("Proof of \\texorpdfstring{$\\alpha = \\beta$}{alpha equals beta}")
+        assert result == "proof_of_alpha_equals_beta"
+        print("✓ Math mode with texorpdfstring test passed")
+    except Exception as e:
+        print(f"✗ Math mode with texorpdfstring test failed: {e}")
+        return
+
+    # Test 13a: Complex texorpdfstring with mixed content
+    try:
+        result = sanitize_latex_title("\\texorpdfstring{alef $\\alef$ and \\textbf{bold}}{alef and bold}")
+        assert result == "alef_and_bold"
+        print("✓ Complex texorpdfstring test passed")
+    except Exception as e:
+        print(f"✗ Complex texorpdfstring test failed: {e}")
+        return
+
+    # Test 14: Math mode without texorpdfstring (should fail)
+    try:
+        sanitize_latex_title(r"Math with $\alpha = \beta$ without texorpdfstring")
+        print("✗ Math mode error test failed: Should have raised ValueError")
+        return
+    except ValueError:
+        pass  # Expected
+    except Exception as e:
+        print(f"✗ Math mode error test failed with unexpected error: {e}")
+        return
+
+    # Test 15: Complex title with multiple commands
+    try:
+        result = sanitize_latex_title("\\textbf{Bold} and \\textit{Italic} \\LaTeX{} Text")
+        assert result == "bold_and_italic_text", f"Expected 'bold_and_italic_text', got '{result}'"
+        print("✓ Complex title with multiple commands test passed")
+    except Exception as e:
+        print(f"✗ Complex title test failed: {e}")
+        return
+
+    # Test 16: Illegal filename characters
+    try:
+        result = sanitize_latex_title("Title: With/Illegal\\Characters*and?More")
+        assert result == "title_with_illegal_and_more", f"Expected 'title_with_illegal_and_more', got '{result}'"
+        print("✓ Illegal characters test passed")
+    except Exception as e:
+        print(f"✗ Illegal characters test failed: {e}")
+        return
+
+    # Test 17: Very long title truncation
+    try:
+        long_title = "This is a very long section title that exceeds the fifty character limit for filenames"
+        result = sanitize_latex_title(long_title)
+        assert len(result) <= 50
+        assert result == "this_is_a_very_long_section_title_that_exceeds_the"
+        print("✓ Long title truncation test passed")
+    except Exception as e:
+        print(f"✗ Long title truncation test failed: {e}")
+        return
+
+    # Test 18: Empty and None titles
+    try:
+        result1 = sanitize_latex_title("")
+        assert result1 == "untitled"
+
+        result2 = sanitize_latex_title("   ")
+        assert result2 == "untitled"
+
+        result3 = sanitize_latex_title(None)  # type: ignore
+        assert result3 == "untitled"
+        print("✓ Empty/None title test passed")
+    except Exception as e:
+        print(f"✗ Empty/None title test failed: {e}")
+        return
+
+    # Test 19: Multiple consecutive spaces and underscores
+    try:
+        result = sanitize_latex_title("Section    with     many   spaces")
+        assert result == "section_with_many_spaces"
+
+        result = sanitize_latex_title("Section_with___underscores")
+        assert result == "section_with_underscores"
+        print("✓ Multiple spaces/underscores test passed")
+    except Exception as e:
+        print(f"✗ Multiple spaces/underscores test failed: {e}")
+        return
+
+    # Test 20: Nested LaTeX commands
+    try:
+        result = sanitize_latex_title("\\textbf{\\textit{Nested} Commands} Here")
+        assert result == "nested_commands_here"
+        print("✓ Nested LaTeX commands test passed")
+    except Exception as e:
+        print(f"✗ Nested LaTeX commands test failed: {e}")
+        return
+
+    # Test 21: Special characters and quotes
+    try:
+        result = sanitize_latex_title("Section's \"Title\" with 'quotes'")
+        assert result == "section_s_title_with_quotes"
+        print("✓ Special characters and quotes test passed")
+    except Exception as e:
+        print(f"✗ Special characters and quotes test failed: {e}")
+        return
+
+    # Test 22: Integration with existing parsing (update section titles)
+    try:
+        test_with_complex_titles = r"""
+\documentclass{article}
+\begin{document}
+\section{\textit{Introduction} to \LaTeX}
+\subsection{Math: \texorpdfstring{$\alpha + \beta$}{alpha plus beta}}
+\section{Conclusion: Final Thoughts}
+\end{document}
+"""
+        document = parse_latex_document(test_with_complex_titles, max_depth=2)
+
+        assert len(document.sections) == 3
+        assert document.sections[0].sanitized_title == "introduction_to_latex"
+        assert document.sections[1].sanitized_title == "math_alpha_plus_beta"
+        assert document.sections[2].sanitized_title == "conclusion_final_thoughts"
+        print("✓ Integration with parsing test passed")
+    except Exception as e:
+        print(f"✗ Integration with parsing test failed: {e}")
+        return
+
+    print("✓ All Phase 2 content processing tests passed!")
+
+    # Phase 3: File Generation Tests
+    print("Running Phase 3 file generation tests...")
+
+    # Test 23: create_section_file_paths with normal hierarchy
+    try:
+        from tempfile import TemporaryDirectory
+
+        sections = [
+            Section(level=1, section_type="section", title="Introduction",
+                   sanitized_title="introduction", content="\\section{Introduction}\nIntro content",
+                   line_number=1, is_starred=False),
+            Section(level=2, section_type="subsection", title="Background",
+                   sanitized_title="background", content="\\subsection{Background}\nBackground content",
+                   line_number=3, is_starred=False),
+            Section(level=1, section_type="section", title="Methods",
+                   sanitized_title="methods", content="\\section{Methods}\nMethods content",
+                   line_number=5, is_starred=False)
+        ]
+
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            file_paths = create_section_file_paths(sections, output_dir)
+
+            assert len(file_paths) == 3
+            assert file_paths[0] == output_dir / "introduction" / "introduction.tex"
+            assert file_paths[1] == output_dir / "introduction" / "background.tex"
+            assert file_paths[2] == output_dir / "methods" / "methods.tex"
+
+        print("✓ create_section_file_paths normal hierarchy test passed")
+    except Exception as e:
+        print(f"✗ create_section_file_paths normal hierarchy test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # Test 24: create_section_file_paths with subsections only
+    try:
+        subsections_only = [
+            Section(level=2, section_type="subsection", title="Introduction",
+                   sanitized_title="introduction", content="\\subsection{Introduction}\nIntro content",
+                   line_number=1, is_starred=False),
+            Section(level=2, section_type="subsection", title="Methods",
+                   sanitized_title="methods", content="\\subsection{Methods}\nMethods content",
+                   line_number=3, is_starred=False)
+        ]
+
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            file_paths = create_section_file_paths(subsections_only, output_dir)
+
+            assert len(file_paths) == 2
+            assert file_paths[0] == output_dir / "introduction" / "introduction.tex"
+            assert file_paths[1] == output_dir / "methods" / "methods.tex"
+
+        print("✓ create_section_file_paths subsections only test passed")
+    except Exception as e:
+        print(f"✗ create_section_file_paths subsections only test failed: {e}")
+        return
+
+    # Test 25: create_section_file_paths with complex hierarchy
+    try:
+        complex_sections = [
+            Section(level=1, section_type="section", title="Introduction",
+                   sanitized_title="introduction", content="", line_number=1, is_starred=False),
+            Section(level=2, section_type="subsection", title="Background",
+                   sanitized_title="background", content="", line_number=3, is_starred=False),
+            Section(level=3, section_type="subsubsection", title="Theory",
+                   sanitized_title="theory", content="", line_number=5, is_starred=False),
+            Section(level=3, section_type="subsubsection", title="Practice",
+                   sanitized_title="practice", content="", line_number=7, is_starred=False),
+            Section(level=2, section_type="subsection", title="Methods",
+                   sanitized_title="methods", content="", line_number=9, is_starred=False),
+            Section(level=1, section_type="section", title="Conclusion",
+                   sanitized_title="conclusion", content="", line_number=11, is_starred=False)
+        ]
+
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            file_paths = create_section_file_paths(complex_sections, output_dir)
+
+            # Verify hierarchical structure
+            assert len(file_paths) == 6
+            assert file_paths[0] == output_dir / "introduction" / "introduction.tex"
+            assert file_paths[1] == output_dir / "introduction" / "background.tex"
+            assert file_paths[2] == output_dir / "introduction" / "background" / "theory.tex"
+            assert file_paths[3] == output_dir / "introduction" / "background" / "practice.tex"
+            assert file_paths[4] == output_dir / "introduction" / "methods.tex"
+            assert file_paths[5] == output_dir / "conclusion" / "conclusion.tex"
+
+        print("✓ create_section_file_paths complex hierarchy test passed")
+    except Exception as e:
+        print(f"✗ create_section_file_paths complex hierarchy test failed: {e}")
+        return
+
+    # Test 26: generate_main_tex_content
+    try:
+        document = ParsedDocument(
+            preamble="\\documentclass{article}\n\\begin{document}",
+            body="Some content",
+            sections=[
+                Section(level=1, section_type="section", title="Introduction",
+                       sanitized_title="introduction", content="", line_number=1, is_starred=False)
+            ],
+            unsectioned_content="Unsectioned content here.",
+            postamble="\\end{document}"
+        )
+
+        file_paths = {0: Path("introduction/introduction.tex")}
+
+        content = generate_main_tex_content(document, file_paths, "main.tex")
+
+        assert "\\documentclass{article}" in content
+        assert "\\begin{document}" in content
+        assert "Unsectioned content here." in content
+        assert "\\include{introduction/introduction}" in content
+        assert "\\end{document}" in content
+
+        print("✓ generate_main_tex_content test passed")
+    except Exception as e:
+        print(f"✗ generate_main_tex_content test failed: {e}")
+        return
+
+    # Test 27: generate_section_content
+    try:
+        section = Section(
+            level=1, section_type="section", title="Introduction",
+            sanitized_title="introduction",
+            content="\\section{Introduction}\nThis is the introduction.\nSome more content.",
+            line_number=1, is_starred=False
+        )
+
+        content = generate_section_content(section)
+
+        assert "\\section{Introduction}" in content
+        assert "This is the introduction." in content
+        assert "Some more content." in content
+
+        print("✓ generate_section_content test passed")
+    except Exception as e:
+        print(f"✗ generate_section_content test failed: {e}")
+        return
+
+    # Test 28: write_files_safe functionality (test without actual file creation)
+    try:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            test_file = output_dir / "test.tex"
+
+            # Test writing new file
+            files = [(test_file, "Test content")]
+            write_files_safe(files, force=False)
+
+            # File should exist now
+            assert test_file.exists()
+
+            # Test content
+            with open(test_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                assert content == "Test content"
+
+            # Test error on existing file without force
+            try:
+                write_files_safe(files, force=False)
+                print("✗ write_files_safe should have raised FileExistsError")
+                return
+            except FileExistsError:
+                pass  # Expected
+
+            # Test overwrite with force
+            files = [(test_file, "Updated content")]
+            write_files_safe(files, force=True)
+
+            with open(test_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                assert content == "Updated content"
+
+        print("✓ write_files_safe test passed")
+    except Exception as e:
+        print(f"✗ write_files_safe test failed: {e}")
+        return
+
+    print("✓ All Phase 3 file generation tests passed!")
+
+    print(f"All comprehensive tests passed! ✓")
+    print(f"Phase 1: 10 scenarios | Phase 2: 12 scenarios | Phase 3: 6 scenarios")
+    print(f"Total: {28} different test scenarios covering all functionality.")
+
+
+if __name__ == "__main__":
+    main()

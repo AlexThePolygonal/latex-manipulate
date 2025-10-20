@@ -1,0 +1,10 @@
+aux/*
+planning*.md
+CLAUDE.md
+temp*
+tmp*
+*.tmp
+*.temp
+*.secret
+*.ignore
+demo_output/*
