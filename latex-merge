@@ -49,6 +49,8 @@ def process_file(
 
         # Process each line
         for line_num, line in enumerate(lines, 1):
+            if line[-1] != '\n':
+                line += '\n'  # Ensure line ends with newline
             # Skip commented lines
             if line.strip().startswith('%'):
                 output_lines.append(line)
@@ -254,24 +256,20 @@ def main() -> None:
         print(f"Error: Output file '{output_path}' already exists. Use --force to overwrite.", file=sys.stderr)
         sys.exit(1)
 
-    try:
-        if args.verbose:
-            print(f"Merging '{input_path}' -> '{output_path}'")
+    if args.verbose:
+        print(f"Merging '{input_path}' -> '{output_path}'")
 
-        # Process the file
-        output_lines: List[str] = []
-        process_file(input_path, output_lines, set(), args.verbose)
+    # Process the file
+    output_lines: List[str] = []
+    process_file(input_path, output_lines, set(), args.verbose)
 
-        # Write output
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.writelines(output_lines)
+    # Write output
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.writelines(output_lines)
 
-        if args.verbose:
-            print(f"Successfully merged {len(output_lines)} lines")
+    if args.verbose:
+        print(f"Successfully merged {len(output_lines)} lines")
 
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
 
 
 if __name__ == "__main__":
